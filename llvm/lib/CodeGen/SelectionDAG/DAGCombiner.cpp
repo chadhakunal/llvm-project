@@ -14126,6 +14126,17 @@ SDValue DAGCombiner::visitVSELECT(SDNode *N) {
         DAG.getNode(ISD::AND, DL, N0.getValueType(), N1.getOperand(1), N0));
   }
 
+  // vselect(mask, sext(A), sext(B)) -> sext(vselect(mask, A, B))
+  // vselect(mask, zext(A), zext(B)) -> zext(vselect(mask, A, B))
+  if((N1.getOpcode() == ISD::SIGN_EXTEND || N1.getOpcode() == ISD::ZERO_EXTEND) &&
+      N1.getOpcode() == N2.getOpcode() &&
+      N1.getOperand(0).getValueType() == N2.getOperand(0).getValueType() &&
+      (N1.hasOneUse() || N2.hasOneUse())) {
+    EVT NarrowVT = N1.getOperand(0).getValueType(); // sext <16xi8> %a -> <16xi16>
+    SDValue NarrowVSelect = DAG.getNode(ISD::VSELECT, DL, NarrowVT, N0, N1.getOperand(0), N2.getOperand(0));
+    return DAG.getNode(N1.getOpcode(), DL, VT, NarrowVSelect);
+  }
+
   // Canonicalize integer abs.
   // vselect (setg[te] X,  0),  X, -X ->
   // vselect (setgt    X, -1),  X, -X ->
