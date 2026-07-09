@@ -3813,6 +3813,7 @@ static bool hasOnlySelectUsers(const Value *Cond) {
 }
 
 void SelectionDAGBuilder::visitSelect(const User &I) {
+  errs() << "WE ARE HERE1\n";
   SmallVector<EVT, 4> ValueVTs;
   ComputeValueVTs(DAG.getTargetLoweringInfo(), DAG.getDataLayout(), I.getType(),
                   ValueVTs);

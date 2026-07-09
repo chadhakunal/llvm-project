@@ -1490,6 +1490,21 @@ static Value *foldAbsDiff(ICmpInst *Cmp, Value *TVal, Value *FVal,
                                          Builder.getFalse());
   }
 
+  // TMP Change:
+  // With any pair of no-wrap subtracts:
+  // (A > B) ? (A - B) : (B - A) --> abs(A - B)
+  
+  // if (Pred == CmpInst::ICMP_UGT &&
+  //     match(TI, m_Sub(m_ZExtOrSelf(m_Specific(A)), m_ZExtOrSelf(m_Specific(B)))) &&
+  //     match(FI, m_Sub(m_ZExtOrSelf(m_Specific(B)), m_ZExtOrSelf(m_Specific(A)))) &&
+  //     (TI->hasNoSignedWrap() || TI->hasNoUnsignedWrap()) &&
+  //     (FI->hasNoSignedWrap() || FI->hasNoUnsignedWrap())) {
+  //   TI->setHasNoUnsignedWrap(false);
+  //   if (!TI->hasNoSignedWrap())
+  //     TI->setHasNoSignedWrap(TI->hasOneUse());
+  //   return Builder.CreateBinaryIntrinsic(Intrinsic::abs, TI, Builder.getTrue());
+  // }
+
   return nullptr;
 }
 

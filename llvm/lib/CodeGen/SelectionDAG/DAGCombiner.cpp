@@ -14104,6 +14104,36 @@ SDValue DAGCombiner::visitVSELECT(SDNode *N) {
   EVT VT = N->getValueType(0);
   SDLoc DL(N);
 
+  llvm::errs() << "TMP: visitVSELECT called!\n";
+  llvm::errs() << "  Result VT: " << VT.getEVTString() << "\n";
+  llvm::errs() << "  N0 (mask) VT: " << N0.getValueType().getEVTString() << "\n";
+  llvm::errs() << "  N1 VT: " << N1.getValueType().getEVTString() << "\n";
+  llvm::errs() << "  N2 VT: " << N2.getValueType().getEVTString() << "\n";
+  llvm::errs() << "  N0 opcode: " << N0->getOperationName(&DAG) << "\n";
+  llvm::errs() << "  N1 opcode: " << N1->getOperationName(&DAG) << "\n";
+  llvm::errs() << "  N2 opcode: " << N2->getOperationName(&DAG) << "\n";
+  N->dump(&DAG);
+
+  // vselect(mask, sext(A), sext(B)) -> sext(vselect(mask, A, B))
+  // vselect(mask, zext(A), zext(B)) -> zext(vselect(mask, A, B))
+  // Narrowing the select below matching extends lets the select (and its
+  // mask) be computed at a narrower, possibly-legal width instead of forcing
+  // both arms to be widened before the select is formed.
+  if ((N1.getOpcode() == ISD::SIGN_EXTEND ||
+       N1.getOpcode() == ISD::ZERO_EXTEND) &&
+      N1.getOpcode() == N2.getOpcode() &&
+      N1.getOperand(0).getValueType() == N2.getOperand(0).getValueType() &&
+      (N1.hasOneUse() || N2.hasOneUse())) {
+    EVT NarrowVT = N1.getOperand(0).getValueType();
+    if (NarrowVT.getVectorElementCount() == VT.getVectorElementCount()) {
+      llvm::errs() << "TMP: narrowing vselect through matching extends to "
+                   << NarrowVT.getEVTString() << "\n";
+      SDValue NarrowSel = DAG.getNode(ISD::VSELECT, DL, NarrowVT, N0,
+                                      N1.getOperand(0), N2.getOperand(0));
+      return DAG.getNode(N1.getOpcode(), DL, VT, NarrowSel);
+    }
+  }
+
   if (SDValue V = DAG.simplifySelect(N0, N1, N2))
     return V;
 

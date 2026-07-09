@@ -3420,6 +3420,29 @@ InstructionCost AArch64TTIImpl::getCastInstrCost(unsigned Opcode, Type *Dst,
       return 0;
   }
 
+  errs() << "TMP: Checking if we are here! \n";
+  // TMP: If all users of the cast can absorb the widening, the cast is free.
+  if (I && !I->hasOneUser() && !I->user_empty() &&
+      all_of(I->users(), [&](const User *U) {
+        auto *SingleUser = cast<Instruction>(U);
+        SmallVector<const Value *, 4> Operands(SingleUser->operand_values());
+        if (isBinExtWideningInstruction(
+                SingleUser->getOpcode(), Dst, Operands,
+                Src != I->getOperand(0)->getType() ? Src : nullptr))
+          return true;
+        if (isSingleExtWideningInstruction(
+                SingleUser->getOpcode(), Dst, Operands,
+                Src != I->getOperand(0)->getType() ? Src : nullptr))
+          return true;
+        if ((isa<ZExtInst>(I) || isa<SExtInst>(I)) &&
+            isExtPartOfAvgExpr(SingleUser, Dst, Src))
+          return true;
+        return false;
+      })) {
+    errs() << "TMP: all users can absorb widening, cast is free: " << *I << "\n";
+    return 0;
+  }
+
   EVT SrcTy = TLI->getValueType(DL, Src);
   EVT DstTy = TLI->getValueType(DL, Dst);
 
