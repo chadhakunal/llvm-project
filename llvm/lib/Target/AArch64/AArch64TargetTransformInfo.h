@@ -64,6 +64,17 @@ class AArch64TTIImpl final : public BasicTTIImplBase<AArch64TTIImpl> {
                                       ArrayRef<const Value *> Args,
                                       Type *SrcOverrideTy = nullptr) const;
 
+
+  /// Determine whether a User can absorb the cast from Src to
+  /// Dst into a widening instruction (e.g. uaddl, saddw, urhadd), making
+  /// the cast free with respect to that user.
+  std::optional<InstructionCost> getUserAbsorbedCastCost(
+                                    const Instruction *SingleUser, 
+                                    Type *Dst, Type *Src, 
+                                    const Instruction *I,
+                                    unsigned Opcode, 
+                                    TTI::TargetCostKind CostKind) const;
+
   // A helper function called by 'getVectorInstrCost'.
   //
   // 'Val' and 'Index' are forwarded from 'getVectorInstrCost';
