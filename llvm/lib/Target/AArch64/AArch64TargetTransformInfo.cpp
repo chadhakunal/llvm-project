@@ -3562,52 +3562,6 @@ bool AArch64TTIImpl::isExtPartOfAvgExpr(const Instruction *ExtUser, Type *Dst,
   return false;
 }
 
-std::optional<InstructionCost> AArch64TTIImpl::getUserAbsorbedCastCost(
-    const Instruction *SingleUser, Type *Dst, Type *Src, const Instruction *I,
-    unsigned Opcode, TTI::TargetCostKind CostKind) const {
-  SmallVector<const Value *, 4> Operands(SingleUser->operand_values());
-
-  if (Type *ExtTy = isBinExtWideningInstruction(
-          SingleUser->getOpcode(), Dst, Operands,
-          Src != I->getOperand(0)->getType() ? Src : nullptr)) {
-    // The cost from Src->Src*2 needs to be added if required, the cost from
-    // Src*2->ExtTy is free.
-    if (ExtTy->getScalarSizeInBits() > Src->getScalarSizeInBits() * 2) {
-      Type *DoubleSrcTy =
-          Src->getWithNewBitWidth(Src->getScalarSizeInBits() * 2);
-      return getCastInstrCost(Opcode, DoubleSrcTy, Src,
-                              TTI::CastContextHint::None, CostKind);
-    }
-
-    return 0;
-  }
-
-  if (isSingleExtWideningInstruction(
-          SingleUser->getOpcode(), Dst, Operands,
-          Src != I->getOperand(0)->getType() ? Src : nullptr)) {
-    // For adds only count the second operand as free if both operands are
-    // extends but not the same operation. (i.e both operands are not free in
-    // add(sext, zext)).
-    if (SingleUser->getOpcode() == Instruction::Add) {
-      if (I == SingleUser->getOperand(1) ||
-          (isa<CastInst>(SingleUser->getOperand(1)) &&
-           cast<CastInst>(SingleUser->getOperand(1))->getOpcode() == Opcode))
-        return 0;
-    } else {
-      // Others are free so long as isSingleExtWideningInstruction
-      // returned true.
-      return 0;
-    }
-  }
-
-  // The cast will be free for the s/urhadd instructions
-  if ((isa<ZExtInst>(I) || isa<SExtInst>(I)) &&
-      isExtPartOfAvgExpr(SingleUser, Dst, Src))
-    return 0;
-
-  return std::nullopt;
-}
-
 InstructionCost AArch64TTIImpl::getCastInstrCost(unsigned Opcode, Type *Dst,
                                                  Type *Src,
                                                  TTI::CastContextHint CCH,
@@ -3618,12 +3572,61 @@ InstructionCost AArch64TTIImpl::getCastInstrCost(unsigned Opcode, Type *Dst,
   // If the cast is observable, and it is used by a widening instruction (e.g.,
   // uaddl, saddw, etc.), it may be free.
   if (I && !I->users().empty()) {
+    // Determine whether SingleUser can absorb the cast from Src to Dst into a
+    // widening instruction (e.g. uaddl, saddw, urhadd), making the cast free
+    // with respect to that user.
+    auto GetUserAbsorbedCastCost =
+        [&](const Instruction *SingleUser) -> std::optional<InstructionCost> {
+      SmallVector<const Value *, 4> Operands(SingleUser->operand_values());
+
+      if (Type *ExtTy = isBinExtWideningInstruction(
+              SingleUser->getOpcode(), Dst, Operands,
+              Src != I->getOperand(0)->getType() ? Src : nullptr)) {
+        // The cost from Src->Src*2 needs to be added if required, the cost
+        // from Src*2->ExtTy is free.
+        if (ExtTy->getScalarSizeInBits() > Src->getScalarSizeInBits() * 2) {
+          Type *DoubleSrcTy =
+              Src->getWithNewBitWidth(Src->getScalarSizeInBits() * 2);
+          return getCastInstrCost(Opcode, DoubleSrcTy, Src,
+                                  TTI::CastContextHint::None, CostKind);
+        }
+
+        return 0;
+      }
+
+      if (isSingleExtWideningInstruction(
+              SingleUser->getOpcode(), Dst, Operands,
+              Src != I->getOperand(0)->getType() ? Src : nullptr)) {
+        // For adds only count the second operand as free if both operands
+        // are extends but not the same operation. (i.e both operands are
+        // not free in add(sext, zext)).
+        if (SingleUser->getOpcode() == Instruction::Add) {
+          if (I == SingleUser->getOperand(1) ||
+              (isa<CastInst>(SingleUser->getOperand(1)) &&
+               cast<CastInst>(SingleUser->getOperand(1))->getOpcode() ==
+                   Opcode))
+            return 0;
+        } else {
+          // Others are free so long as isSingleExtWideningInstruction
+          // returned true.
+          return 0;
+        }
+      }
+
+      // The cast will be free for the s/urhadd instructions
+      if ((isa<ZExtInst>(I) || isa<SExtInst>(I)) &&
+          isExtPartOfAvgExpr(SingleUser, Dst, Src))
+        return 0;
+
+      return std::nullopt;
+    };
+
     InstructionCost MaxAbsorbedCost = 0;
     bool AllUsersAbsorbCast = true;
     for (const User *U : I->users()) {
       auto *SingleUser = cast<Instruction>(U);
       std::optional<InstructionCost> UserCost =
-          getUserAbsorbedCastCost(SingleUser, Dst, Src, I, Opcode, CostKind);
+          GetUserAbsorbedCastCost(SingleUser);
       if (!UserCost) {
         AllUsersAbsorbCast = false;
         break;
