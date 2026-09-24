@@ -63,6 +63,24 @@ static bool hasBcmp(const Triple &TT) {
   return TT.isOSFreeBSD() || TT.isOSSolaris();
 }
 
+// Targets whose C library guarantees malloc/calloc return pointers aligned
+// to alignof(max_align_t) regardless of the size requested (the "strong
+// alignment" reading that predates C23 / WG14 N2293, which adopted "weak
+// alignment" as the new baseline, e.g. malloc(1) need only be aligned as
+// char). This must be an explicit, maintained whitelist of confirmed-strong
+// implementations, not assumed by default. Add entries here only once
+// confirmed (docs/source reading/testing) -- starting minimal and growing
+// over time.
+static bool hasStrongMallocAlignment(const Triple &T) {
+  switch (T.getOS()) {
+  case Triple::Linux:
+    // glibc and musl both guarantee strong alignment for malloc/calloc.
+    return T.isGNUEnvironment() || T.isMusl();
+  default:
+    return false;
+  }
+}
+
 static bool isCallingConvCCompatible(CallingConv::ID CC, const Triple &TT,
                                      FunctionType *FuncTy) {
   switch (CC) {
@@ -1444,6 +1462,43 @@ unsigned TargetLibraryInfoImpl::getWCharSize(const Module &M) const {
       M.getModuleFlag("wchar_size")))
     return cast<ConstantInt>(ShortWChar->getValue())->getZExtValue();
   return Triple(M.getTargetTriple()).getDefaultWCharSize();
+}
+
+Align TargetLibraryInfoImpl::getMaxAlignTAlignment(const Module &M) const {
+
+ /*
+ std::max(DL.getABITypeAlign(Type::getInt64Ty(Ctx)), DL.getABITypeAlign(Type::getDoubleTy(Ctx)))
+ */
+
+  // TODO: once a frontend (e.g. Clang) emits the real alignof(max_align_t)
+  // as a module flag (mirroring "wchar_size" above), prefer that here and
+  // only fall back to this target-derived default when it is absent.
+  Triple T(M.getTargetTriple());
+
+  // alignof(max_align_t) is a C-language concept (typically defined in
+  // terms of `long double`), which has no single corresponding LLVM IR
+  // type, so this is kept as a maintained set of per-target constants
+  // rather than derived from DataLayout. Where a target isn't listed, the
+  // default is chosen to under-count rather than over-count -- a wrong-low
+  // alignment fact merely misses an optimization, while a wrong-high one
+  // would be unsound.
+  switch (T.getArch()) {
+  case Triple::x86:
+  case Triple::x86_64:
+    // long double is 8 bytes (== double) under MSVC, 16 bytes (80-bit
+    // extended, padded) otherwise.
+    return T.isWindowsMSVCEnvironment() ? Align(8) : Align(16);
+  case Triple::aarch64:
+  case Triple::aarch64_be:
+    // long double == double on Darwin; IEEE quad-precision elsewhere.
+    return T.isOSDarwin() ? Align(8) : Align(16);
+  default:
+    return Align(8);
+  }
+}
+
+bool TargetLibraryInfoImpl::hasStrongMallocAlignment(const Module &M) const {
+  return ::hasStrongMallocAlignment(Triple(M.getTargetTriple()));
 }
 
 unsigned TargetLibraryInfoImpl::getSizeTSize(const Module &M) const {

@@ -16,6 +16,7 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Bitset.h"
+#include "llvm/ADT/bit.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -4936,6 +4937,35 @@ bool InstCombinerImpl::annotateAnyAllocSite(CallBase &Call,
       Changed = !Call.hasRetAttr(Attribute::DereferenceableOrNull);
       Call.addRetAttr(Attribute::getWithDereferenceableOrNullBytes(
           Call.getContext(), Size->getLimitedValue()));
+    }
+
+    // malloc/calloc have no alignment argument, so getAllocAlignment()
+    // below can't help them. But even on targets without a strong
+    // alignment guarantee (see TargetLibraryInfoImpl::
+    // hasStrongMallocAlignment), a known constant size still gives a
+    // lower bound on the returned pointer's alignment per C23 / WG14
+    // N2293's "weak alignment": the pointer need only be aligned as
+    // strongly as the largest fundamental type that fits in Size bytes,
+    // capped at alignof(max_align_t). Strong-alignment targets already
+    // get the full alignof(max_align_t) via the Function-level attribute
+    // set in BuildLibCalls.cpp's setMaxAlign, which CallBase::getRetAlign()
+    // falls back to, so this is purely for the weak-alignment case.
+    LibFunc TheLibFunc;
+    if (TLI && TLI->getLibFunc(Call, TheLibFunc) &&
+        (TheLibFunc == LibFunc_malloc || TheLibFunc == LibFunc_vec_malloc ||
+         TheLibFunc == LibFunc_calloc || TheLibFunc == LibFunc_vec_calloc)) {
+      uint64_t SizeVal = Size->getLimitedValue();
+      if (SizeVal != 0) {
+        Align MaxAlign = TLI->getMaxAlignTAlignment(*Call.getModule());
+        Align WeakAlign(std::min<uint64_t>(llvm::bit_floor(SizeVal),
+                                           MaxAlign.value()));
+        Align ExistingAlign = Call.getRetAlign().valueOrOne();
+        if (WeakAlign > ExistingAlign) {
+          Call.addRetAttr(
+              Attribute::getWithAlignment(Call.getContext(), WeakAlign));
+          Changed = true;
+        }
+      }
     }
   }
 

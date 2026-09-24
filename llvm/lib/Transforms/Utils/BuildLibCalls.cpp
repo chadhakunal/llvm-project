@@ -325,6 +325,21 @@ static bool setAllocKind(Function &F, AllocFnKind K) {
   return true;
 }
 
+// Sets align(alignof(max_align_t)) on F's return value, but only on targets
+// whose libc guarantees that malloc/calloc always return pointers aligned
+// that strongly, regardless of the size requested.
+static bool setMaxAlign(Function &F, const TargetLibraryInfo &TLI) {
+  if (F.getParent() == nullptr ||
+      !TLI.hasStrongMallocAlignment(*F.getParent()))
+    return false;
+  Align MaxAlign = TLI.getMaxAlignTAlignment(*F.getParent());
+  if (F.getAttributes().getRetAlignment().valueOrOne() >= MaxAlign)
+    return false;
+  F.addRetAttr(Attribute::getWithAlignment(F.getContext(), MaxAlign));
+  return true;
+}
+
+
 bool llvm::inferNonMandatoryLibFuncAttrs(Module *M, StringRef Name,
                                          const TargetLibraryInfo &TLI) {
   Function *F = M->getFunction(Name);
@@ -553,6 +568,7 @@ bool llvm::inferNonMandatoryLibFuncAttrs(Function &F,
     Changed |= setDoesNotThrow(F);
     Changed |= setRetDoesNotAlias(F);
     Changed |= setWillReturn(F);
+    Changed |= setMaxAlign(F, TLI);
     break;
   case LibFunc_memcmp:
     Changed |= setOnlyAccessesArgMemory(F);
@@ -757,6 +773,7 @@ bool llvm::inferNonMandatoryLibFuncAttrs(Function &F,
     Changed |= setDoesNotThrow(F);
     Changed |= setRetDoesNotAlias(F);
     Changed |= setWillReturn(F);
+    Changed |= setMaxAlign(F, TLI);
     break;
   case LibFunc_chmod:
   case LibFunc_chown:

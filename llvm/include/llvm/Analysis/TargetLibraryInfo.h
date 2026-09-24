@@ -237,6 +237,16 @@ public:
   /// Returns the size of the size_t type in bits.
   LLVM_ABI unsigned getSizeTSize(const Module &M) const;
 
+  /// Returns alignof(max_align_t) for the target this Module was compiled
+  /// for.
+  LLVM_ABI Align getMaxAlignTAlignment(const Module &M) const;
+
+  /// Returns true if the target's libc guarantees that malloc/calloc always
+  /// return pointers aligned to alignof(max_align_t), regardless of the
+  /// size requested ("strong alignment", as opposed to the "weak
+  /// alignment" baseline legitimized by WG14 N2293 / C23).
+  LLVM_ABI bool hasStrongMallocAlignment(const Module &M) const;
+
   /// Get size of a C-level int or unsigned int, in bits.
   unsigned getIntSize() const {
     return SizeOfInt;
@@ -554,6 +564,16 @@ public:
 
   /// \copydoc TargetLibraryInfoImpl::getSizeTSize()
   unsigned getSizeTSize(const Module &M) const { return Impl->getSizeTSize(M); }
+
+  /// \copydoc TargetLibraryInfoImpl::getMaxAlignTAlignment()
+  Align getMaxAlignTAlignment(const Module &M) const {
+    return Impl->getMaxAlignTAlignment(M);
+  }
+
+  /// \copydoc TargetLibraryInfoImpl::hasStrongMallocAlignment()
+  bool hasStrongMallocAlignment(const Module &M) const {
+    return Impl->hasStrongMallocAlignment(M);
+  }
 
   /// Returns an IntegerType corresponding to size_t.
   IntegerType *getSizeTType(const Module &M) const {
