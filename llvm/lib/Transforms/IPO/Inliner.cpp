@@ -62,6 +62,10 @@
 #include <cassert>
 #include <utility>
 
+#include "llvm/Analysis/InstructionSimplify.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/DataLayout.h"
+
 using namespace llvm;
 
 #define DEBUG_TYPE "inline"
@@ -195,6 +199,94 @@ void makeFunctionBodyUnreachable(Function &F) {
     BB.eraseFromParent();
   BasicBlock *BB = BasicBlock::Create(F.getContext(), "", &F);
   new UnreachableInst(F.getContext(), BB);
+}
+
+static void forwardAndFold(ArrayRef<BasicBlock *> Region,
+                           const DataLayout &DL) {
+  // 1. Forward stores to loads.
+  for (BasicBlock *BB : Region) {
+    for (Instruction &I : make_early_inc_range(*BB)) {
+      auto *LI = dyn_cast<LoadInst>(&I);
+      if (!LI || !LI->isSimple())
+        continue;
+
+      int64_t Off = 0;
+      Value *Base =
+          GetPointerBaseWithConstantOffset(LI->getPointerOperand(), Off, DL);
+      TypeSize TS = DL.getTypeStoreSize(LI->getType());
+      if (!Base || TS.isScalable())
+        continue;
+
+      CallBaseMemorySummary S = buildCallBaseMemorySummary(*LI);
+      for (const MemoryFact &F : S.Facts) {
+        if (F.Base == Base && F.Offset == Off &&
+            F.Size == TS.getFixedValue() &&
+            F.StoredValue->getType() == LI->getType()) {
+          LLVM_DEBUG(dbgs() << "  forward: " << *LI << "  <-  "
+                            << *F.StoredValue << "\n");
+          LI->replaceAllUsesWith(F.StoredValue);
+          LI->eraseFromParent();
+          break;
+        }
+      }
+    }
+  }
+
+  // 2. Fold whatever the forwarding made constant.
+  SimplifyQuery SQ(DL);
+  for (BasicBlock *BB : Region)
+    for (Instruction &I : make_early_inc_range(*BB))
+      if (Value *V = simplifyInstruction(&I, SQ)) {
+        LLVM_DEBUG(dbgs() << "  simplify: " << I << "  ->  " << *V << "\n");
+        I.replaceAllUsesWith(V);
+        if (isInstructionTriviallyDead(&I))
+          I.eraseFromParent();
+      }
+}
+
+static void cleanupInlinedRegion(BasicBlock *First, BasicBlock *Last,
+                                 SmallVectorImpl<CallBase *> &Calls, int I,
+                                 InlineFunctionInfo &IFI) {
+  Function &F = *First->getParent();
+  const DataLayout &DL = F.getDataLayout();
+
+  SmallVector<BasicBlock *, 8> Region;
+  for (auto It = First->getIterator();; ++It) {
+    Region.push_back(&*It);
+    if (&*It == Last)
+      break;
+  }
+
+  forwardAndFold(Region, DL);
+
+  // Fold branches whose condition became constant.
+  bool Folded = false;
+  for (BasicBlock *BB : Region)
+    Folded |= ConstantFoldTerminator(BB, /*DeleteDeadConditions=*/true);
+  if (!Folded)
+    return;
+
+  // Find what is still reachable. A dead loop still has predecessors (its own
+  // back-edge), so "no predecessors" is not enough.
+  SmallPtrSet<BasicBlock *, 32> Reachable;
+  for (BasicBlock *BB : depth_first(&F))
+    Reachable.insert(BB);
+
+  // Drop call sites in dead blocks BEFORE deleting them. Calls also holds
+  // calls from other functions in the SCC, so only look at this function.
+  auto IsDead = [&](CallBase *C) {
+    return C->getFunction() == &F && !Reachable.count(C->getParent());
+  };
+  Calls.erase(std::remove_if(Calls.begin() + I + 1, Calls.end(), IsDead),
+              Calls.end());
+  erase_if(IFI.InlinedCallSites, IsDead);
+
+  erase_if(Region, [&](BasicBlock *BB) { return !Reachable.count(BB); });
+  removeUnreachableBlocks(F);
+
+  // The dead edges left phis with one incoming value; fold them and whatever
+  // depends on them.
+  forwardAndFold(Region, DL);
 }
 
 PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
@@ -393,9 +485,19 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
       // devirtualized to call any target by replacing the indirectly called
       // function with a function pointer referenced by the caller. The indirect
       // call case is handled within InlineFunction.
-      bool TrackInlineHistory = CalleeSCC->size() != 1 ||
+            bool TrackInlineHistory = CalleeSCC->size() != 1 ||
                                 CalleeSCC->getOuterRefSCC().size() != 1 ||
                                 CalleeN->lookup(CalleeN) != nullptr;
+
+      // Remember where the inlined region starts, and how to find where it
+      // ends. CB is deleted by InlineFunction, so this must be captured first.
+      BasicBlock *InlinedOrigBB = CB->getParent();
+      BasicBlock *InlinedNormalDest = nullptr;
+      WeakTrackingVH InlinedNextVH;
+      if (auto *II = dyn_cast<InvokeInst>(CB))
+        InlinedNormalDest = II->getNormalDest();
+      else
+        InlinedNextVH = CB->getNextNode();
 
       InlineResult IR = InlineFunction(
           *CB, IFI, /*MergeAttributes=*/true,
@@ -406,6 +508,36 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
         Advice->recordUnsuccessfulInlining(IR);
         continue;
       }
+
+      // Find the last block of the inlined region and clean it up.
+      BasicBlock *InlinedLastBB = nullptr;
+      if (InlinedNormalDest) {
+        // invoke: the region ends at the block that branches to the normal
+        // destination (InlineFunction's ".exit" block, or OrigBB itself when a
+        // single-block callee was spliced in).
+        for (BasicBlock &BB :
+             make_range(InlinedOrigBB->getIterator(), F.end()))
+          if (auto *Br = dyn_cast<UncondBrInst>(BB.getTerminator()))
+            if (Br->getSuccessor() == InlinedNormalDest) {
+              InlinedLastBB = &BB;
+              break;
+            }
+      } else if (Value *NextV = InlinedNextVH) {
+        // call: the region ends in the block holding the instruction that
+        // followed the call.
+        InlinedLastBB = cast<Instruction>(NextV)->getParent();
+      }
+      if (InlinedLastBB) {
+        LLVM_DEBUG(dbgs() << "Cleanup after inlining " << Callee.getName()
+                          << " into " << F.getName() << ": region "
+                          << InlinedOrigBB->getName() << " .. "
+                          << InlinedLastBB->getName() << "\n");
+        cleanupInlinedRegion(InlinedOrigBB, InlinedLastBB, Calls, I, IFI);
+      } else {
+        LLVM_DEBUG(dbgs() << "Cleanup skipped after inlining "
+                          << Callee.getName() << ": region end not found\n");
+      }
+      
       // TODO: Shouldn't we be invalidating all analyses on F here?
       // The caller was modified, so invalidate Ephemeral Values.
       FAM.getResult<EphemeralValuesAnalysis>(F).clear();

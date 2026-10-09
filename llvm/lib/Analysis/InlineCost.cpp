@@ -17,6 +17,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/CodeMetrics.h"
 #include "llvm/Analysis/ConstantFolding.h"
@@ -208,6 +209,131 @@ int getInstrCost() { return InstrCost; }
 
 } // namespace llvm
 
+// TODO: Extend to straight line predecessors?
+CallBaseMemorySummary llvm::buildCallBaseMemorySummary(Instruction &At) {
+  enum class Check { Shadowed, Disjoint, Conflict };
+
+  CallBaseMemorySummary Summary;
+  BasicBlock *BB = At.getParent();
+  const DataLayout &DL = BB->getDataLayout();
+  SmallPtrSet<BasicBlock *, 8> Visited;
+  Visited.insert(BB);
+  auto It = At.getIterator();
+
+  while (true) {
+    while (It != BB->begin()) {
+      Instruction &I = *--It;
+
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (!SI->isSimple())
+          return Summary;
+
+        Value *Val = SI->getValueOperand();
+        TypeSize TS = DL.getTypeStoreSize(Val->getType());
+        if (TS.isScalable())
+          return Summary;
+        uint64_t Size = TS.getFixedValue();
+
+        int64_t Off = 0;
+        Value *Base =
+            GetPointerBaseWithConstantOffset(SI->getPointerOperand(), Off, DL);
+        if (!Base)
+          return Summary;
+
+        Check C = Check::Disjoint;
+
+        // Pass 1: facts on the same base decide Shadowed / overlap.
+        for (const MemoryFact &F : Summary.Facts) {
+          if (F.Base != Base)
+            continue;
+          if (F.Offset == Off && F.Size == Size) {
+            C = Check::Shadowed;
+            break;
+          }
+          if (Off < F.Offset + (int64_t)F.Size &&
+              F.Offset < Off + (int64_t)Size) {
+            C = Check::Conflict;
+            break;
+          }
+        }
+
+        // Pass 2: facts on other bases must be provably disjoint.
+        if (C == Check::Disjoint) {
+          for (const MemoryFact &F : Summary.Facts) {
+            if (F.Base == Base)
+              continue;
+            if (!isIdentifiedObject(Base) || !isIdentifiedObject(F.Base)) {
+              C = Check::Conflict; // may alias
+              break;
+            }
+          }
+        }
+
+        if (C == Check::Shadowed)
+          continue; // a newer store already recorded this location
+        if (C == Check::Conflict)
+          return Summary; // conservative for the PoC
+
+        MemoryFact Fact;
+        Fact.Base = Base;
+        Fact.Offset = Off;
+        Fact.Size = Size;
+        Fact.StoredValue = Val;
+        Fact.Kind = isa<Constant>(Val) ? MemoryValueKind::Constant
+                                       : MemoryValueKind::StoredValue;
+        Summary.Facts.push_back(Fact);
+        continue;
+      }
+
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (!LI->isSimple())
+          return Summary; // volatile/atomic load
+        continue;
+      }
+
+      if (isAssumeLikeIntrinsic(&I))
+        continue;
+
+      if (I.mayWriteToMemory() || I.mayHaveSideEffects())
+        return Summary; // calls, memcpy/memset, atomicrmw, cmpxchg, fences, ...
+    }
+
+    // Reached the start of BB: continue into the unique predecessor.
+    BasicBlock *Pred = BB->getSinglePredecessor();
+    if (!Pred || !Visited.insert(Pred).second)
+      break; // join, entry block, or cycle
+    BB = Pred;
+    It = BB->end();
+  }
+
+  return Summary;
+}
+
+void llvm::printCallBaseMemorySummary(const CallBaseMemorySummary &S,
+                                      const CallBase &CB, raw_ostream &OS) {
+  OS << "MemSummary for call in " << CB.getFunction()->getName() << ": " << CB
+     << "\n";
+  if (S.Facts.empty()) {
+    OS << "  <empty>\n";
+    return;
+  }
+  for (const MemoryFact &F : S.Facts) {
+    OS << "  base=";
+    F.Base->printAsOperand(OS, /*PrintType=*/false);
+    OS << " off=" << F.Offset << " size=" << F.Size << " kind=";
+    switch (F.Kind) {
+    case MemoryValueKind::Unknown:     OS << "Unknown";     break;
+    case MemoryValueKind::Constant:    OS << "Constant";    break;
+    case MemoryValueKind::StoredValue: OS << "StoredValue"; break;
+    }
+    if (F.StoredValue) {
+      OS << " val=";
+      F.StoredValue->printAsOperand(OS, /*PrintType=*/true);
+    }
+    OS << "\n";
+  }
+}
+
 namespace {
 class InlineCostCallAnalyzer;
 
@@ -281,6 +407,9 @@ protected:
 
   /// Getter for the cache of ephemeral values.
   function_ref<EphemeralValuesCache &(Function &)> GetEphValuesCache = nullptr;
+
+
+  CallBaseMemorySummary MemSummary;
 
   /// Extension points for handling callsite features.
   // Called before a basic block was analyzed.
@@ -2341,6 +2470,29 @@ bool CallAnalyzer::visitFNeg(UnaryOperator &I) {
 }
 
 bool CallAnalyzer::visitLoad(LoadInst &I) {
+  if (I.isSimple() &&
+      I.getParent() == &F.getEntryBlock()) {
+    auto [Base, Off] = ConstantOffsetPtrs.lookup(I.getPointerOperand());
+    TypeSize TS = DL.getTypeStoreSize(I.getType());
+    if (Base && Off.isSignedIntN(64) && !TS.isScalable()) {
+      for (const MemoryFact &Fact : MemSummary.Facts) {
+        if (Fact.Base != Base || Fact.Kind != MemoryValueKind::Constant ||
+            Fact.Offset != Off.getSExtValue() ||
+            Fact.Size != TS.getFixedValue())
+          continue;
+        auto *C = cast<Constant>(Fact.StoredValue);
+        if (C->getType() == I.getType()) {
+          LLVM_DEBUG(dbgs() << "Folded load from caller memory: " << I
+                            << " -> " << *C << "\n");
+          SimplifiedValues[&I] = C;
+          return true;
+        }
+        break; // matching location, but the types differ
+      }
+    }
+  }
+
+
   if (handleSROA(I.getPointerOperand(), I.isSimple()))
     return true;
 
@@ -2915,6 +3067,11 @@ void CallAnalyzer::findDeadBlocks(BasicBlock *CurrBB, BasicBlock *NextBB) {
 /// some artifact of the routine.
 InlineResult CallAnalyzer::analyze() {
   ++NumCallsAnalyzed;
+
+
+  // TODO: Can be deferred to when a load is seen
+  MemSummary = buildCallBaseMemorySummary(CandidateCall);
+  LLVM_DEBUG(printCallBaseMemorySummary(MemSummary, CandidateCall, dbgs()));
 
   auto Result = onAnalysisStart();
   if (!Result.isSuccess())

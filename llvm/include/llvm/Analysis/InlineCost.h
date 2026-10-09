@@ -18,6 +18,11 @@
 #include "llvm/Analysis/InlineModelFeatureMaps.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/Compiler.h"
+
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Value.h"
+#include "llvm/Support/raw_ostream.h"
+
 #include <cassert>
 #include <climits>
 #include <optional>
@@ -62,6 +67,30 @@ const char FunctionInlineCostMultiplierAttributeName[] =
 
 const char MaxInlineStackSizeAttributeName[] = "inline-max-stacksize";
 } // namespace InlineConstants
+
+
+enum class MemoryValueKind { Unknown, Constant, StoredValue };
+
+struct MemoryFact {
+  Value *Base = nullptr;
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+
+  MemoryValueKind Kind = MemoryValueKind::Unknown;
+  Value *StoredValue = nullptr;
+};
+
+struct CallBaseMemorySummary {
+  SmallVector<MemoryFact, 8> Facts;
+};
+
+/// Walk backwards from \p CB within its basic block and collect the stores
+/// that are still live at the call site.
+// LLVM_ABI CallBaseMemorySummary buildCallBaseMemorySummary(CallBase &CB);
+LLVM_ABI CallBaseMemorySummary buildCallBaseMemorySummary(Instruction &At);
+
+LLVM_ABI void printCallBaseMemorySummary(const CallBaseMemorySummary &S,
+                                         const CallBase &CB, raw_ostream &OS);
 
 // The cost-benefit pair computed by cost-benefit analysis.
 class CostBenefitPair {
