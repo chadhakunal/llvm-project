@@ -29,6 +29,7 @@
 #include "llvm/Analysis/EphemeralValuesCache.h"
 #include "llvm/Analysis/InlineAdvisor.h"
 #include "llvm/Analysis/InlineCost.h"
+#include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/LazyCallGraph.h"
 #include "llvm/Analysis/Loads.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
@@ -37,6 +38,7 @@
 #include "llvm/Analysis/Utils/ImportedFunctionsInliningStatistics.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -197,6 +199,99 @@ void makeFunctionBodyUnreachable(Function &F) {
   new UnreachableInst(F.getContext(), BB);
 }
 
+/// Lightweight simplification of freshly inlined code, so that the cost model's
+/// backward walk from the next call site can reach through the inlined region.
+/// \p First and \p Last delimit the region in layout order.
+static void postInlineSimplify(BasicBlock *First, BasicBlock *Last,
+                               const DataLayout &DL) {
+  SmallVector<BasicBlock *, 8> Region;
+  for (auto It = First->getIterator();; ++It) {
+    Region.push_back(&*It);
+    if (&*It == Last)
+      break;
+  }
+  SmallPtrSet<BasicBlock *, 8> InRegion(Region.begin(), Region.end());
+  SimplifyQuery SQ(DL);
+
+  // Forward constants stored earlier in the same block to loads, fold what that
+  // makes constant, and resolve branches on constant conditions. Calls are
+  // never erased, since the inliner's worklists may point at them. Returns
+  // whether anything changed.
+  auto SimplifyRegion = [&]() {
+    bool Changed = false;
+    for (BasicBlock *BB : Region) {
+      for (Instruction &I : make_early_inc_range(*BB)) {
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          if (!LI->isSimple())
+            continue;
+          BasicBlock::iterator ScanFrom = LI->getIterator();
+          Value *Stored = FindAvailableLoadedValue(
+              LI, BB, ScanFrom, InlinerForwardingScanLimit);
+          auto *C = dyn_cast_or_null<Constant>(Stored);
+          if (!C)
+            continue;
+          // Handle type mismatches from memset forwarding (e.g. memset writes
+          // i64 0 but the load type is ptr).
+          if (C->getType() != LI->getType()) {
+            if (!C->isNullValue())
+              continue;
+            C = Constant::getNullValue(LI->getType());
+          }
+          LI->replaceAllUsesWith(C);
+          LI->eraseFromParent();
+          Changed = true;
+        } else if (!I.use_empty()) {
+          if (Value *V = simplifyInstruction(&I, SQ)) {
+            I.replaceAllUsesWith(V);
+            Changed = true;
+          }
+        }
+      }
+      Changed |= ConstantFoldTerminator(BB);
+    }
+    return Changed;
+  };
+
+  // Cut the blocks that can no longer be reached from the start of the region
+  // off from the live ones, so that they stop counting as predecessors. The
+  // blocks themselves stay, and so do invokes, which may be call sites in the
+  // inliner's worklists. Returns whether anything changed.
+  auto CutDeadBlocks = [&]() {
+    SmallPtrSet<BasicBlock *, 8> Reachable;
+    SmallVector<BasicBlock *, 8> Worklist;
+    Reachable.insert(First);
+    Worklist.push_back(First);
+    while (!Worklist.empty()) {
+      BasicBlock *BB = Worklist.pop_back_val();
+      for (BasicBlock *Succ : successors(BB))
+        if (InRegion.count(Succ) && Reachable.insert(Succ).second)
+          Worklist.push_back(Succ);
+    }
+
+    bool Changed = false;
+    for (BasicBlock *BB : Region) {
+      Instruction *Term = BB->getTerminator();
+      if (!Reachable.count(BB) && !isa<UnreachableInst>(Term) &&
+          !isa<CallBase>(Term)) {
+        changeToUnreachable(Term);
+        Changed = true;
+      }
+    }
+    return Changed;
+  };
+
+  // Each step can enable the other: cutting a dead predecessor can leave a phi
+  // with a single value, which folds in the next sweep. This converges within
+  // a couple of iterations, so a small constant bound keeps the cost fixed.
+  constexpr unsigned MaxIterations = 4;
+  for (unsigned Iter = 0; Iter < MaxIterations; ++Iter) {
+    bool Changed = SimplifyRegion();
+    Changed |= CutDeadBlocks();
+    if (!Changed)
+      break;
+  }
+}
+
 PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
                                    CGSCCAnalysisManager &AM, LazyCallGraph &CG,
                                    CGSCCUpdateResult &UR) {
@@ -315,6 +410,10 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
     // We bail out as soon as the caller has to change so we can update the
     // call graph and prepare the context of that new caller.
     bool DidInline = false;
+    // Where the code inlined last starts and ends. It is simplified before the
+    // next call site is analysed.
+    BasicBlock *InlinedFirstBB = nullptr;
+    BasicBlock *InlinedLastBB = nullptr;
     for (; I < (int)Calls.size() && Calls[I]->getCaller() == &F; ++I) {
       CallBase *CB = Calls[I];
       Function &Callee = *CB->getCalledFunction();
@@ -337,6 +436,22 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
       // Store-to-load forwarding, loads can be sometimes simplified to
       // constants from stores introduced by previous inlining
       if (DidInline) {
+        // Simplify the code inlined last, so that the analysis of this call
+        // site can see through it.
+
+        if (InlinedLastBB) {
+          // TODO: The store-to-load forwarding for call arguments below could be
+          // replaced by this: it forwards stores to loads in the inlined region,
+          // which is where the stores for this call site's argument loads come
+          // from.
+
+          // TODO: This could be restricted, e.g. to large inlined callees or to a
+          // flag from the cost model, for example when there is a store-to-load
+          // forwarding, to save compile time.
+          postInlineSimplify(InlinedFirstBB, InlinedLastBB, F.getDataLayout());
+          InlinedFirstBB = InlinedLastBB = nullptr;
+        }
+
         for (Value *Arg : CB->args()) {
           auto *LI = dyn_cast<LoadInst>(Arg);
           if (!LI || !LI->isSimple())
@@ -406,6 +521,14 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
         Advice->recordUnsuccessfulInlining(IR);
         continue;
       }
+
+
+      // Remember where the inlined code is. InlineFunction recorded where it
+      // starts and ends; there is no end block if the code after the call was
+      // removed.
+      InlinedFirstBB = IFI.InlinedFirstBB;
+      InlinedLastBB = IFI.InlinedLastBB;
+
       // TODO: Shouldn't we be invalidating all analyses on F here?
       // The caller was modified, so invalidate Ephemeral Values.
       FAM.getResult<EphemeralValuesAnalysis>(F).clear();
